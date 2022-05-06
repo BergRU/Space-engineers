@@ -1,0 +1,2760 @@
+
+
+// Control Tags
+const string StorageTAG         = "[storage]";      // Use this TAG for HQ Cargos
+const string FillingTAG         = "[fill]";         // Take items out of [storage] cargos and fill them in this block, item type and amount defined in CustomData
+const string CleaningTAG        = "[clean]";        // Remove all items out of this block and throw them into [storage] Cargos
+const string CleanAndFillTAG    = "[suckandblow]";  // this name was ferdiheld's idea, remove all items which not listed in CustomData and refill by customData Info
+const string IgnoreTAG          = "[ignore]";       // Ignores this block
+const string DissasembleTAG     = "[disassemble]";  // Items in this CustomData's Cargo get disassembled
+const string TeachModeTAG       = "[teach]";        // Iventory of this block will get read and it's item values get written into CustomData
+const string AutoBuilderTAG     = "[autobuild]";    // This will mark an Assembler to use with autobuilder
+
+// LCDs
+const string HQ_LCD                 = "DebugLCD";   // LCD for HQ Cleaning, Sorting and Filling Info
+const string HQ_ConnectedGridsLCD   = "DebugLCD2";  // LCD for watching incoming connections on Connectors
+
+// Autobuilder LCDs
+const string AutoBuilder_Comp_LCD = "Autobuilder Comp";
+const string AutoBuilder_Tool_LCD = "Autobuilder Tool";
+const string AutoBuilder_Ammo_LCD = "Autobuilder Ammo";
+
+// Security Options
+const string WhiteListedGrids_LCD = "LCD Whitelist";    // Throw out all connected grid which not listed on this LCD
+const string FactionTag = "AMC";                        // Throw out all connection if not have this Faction Tag
+
+const bool CountItems = false;                  // Count Items to show them on LCD [show on LCD not implemented yet]
+
+
+
+const string HQ_Script_Version = "2022-04-19";
+
+// Module functions
+CConnectorMontoring ConnectorMonitor;   // Watching connector status changes
+CDissassembler Disassembler;            // Disassembling items
+CAutoBuilder AutoBuilder;               // Autobuilder for materials
+CLookupTable InventoryLookupTable = null;
+
+
+// Debug & statistic functions
+CDebugLCD DebugLCD;
+CDebugLCD DebugLCD2;
+int ProcessedItemCounter;
+
+// ThreathingControl
+long HQThreadId;
+
+// Saving the connector which currently getting processed
+List<long> ProcessedConnectors = new List<long>();
+
+
+// Storage Blocks
+List<CStorageBlock> HQStorageBlocks = new List<CStorageBlock>();    // HQ Storage Blocks
+List<IMyCargoContainer> HQContainer = new List<IMyCargoContainer>();
+List<IMyGasTank> HQGasTanks = new List<IMyGasTank>();
+List<IMyReactor> HQReactors = new List<IMyReactor>();
+List<IMyRefinery> HQRefineries = new List<IMyRefinery>();
+List<IMyShipConnector> HQConnectors = new List<IMyShipConnector>();
+List<IMyAssembler> HQAssemblers = new List<IMyAssembler>();
+List<IMyShipWelder> HQWelders = new List<IMyShipWelder>(); // Also contains nanobots
+
+// Used for signaling processing connectors
+List<IMyReflectorLight> RotatingLights = new List<IMyReflectorLight>();
+
+
+public void Save()
+{
+    // Save Autobuilder LCD configuration
+    //Storage = AutoBuilder.LCDData.ToString();
+}
+
+public Program()
+{
+    DebugLCD = new CDebugLCD(this, HQ_LCD, 20);
+    DebugLCD2 = new CDebugLCD(this, HQ_ConnectedGridsLCD, 20);
+
+    DebugLCD.SetTopic($"[AMC HQ BadAI {HQ_Script_Version}]\n\n");
+    DebugLCD.Show();
+
+    DebugLCD2.SetTopic($"[AMC Skynet {HQ_Script_Version}]\nInitializing subsystems..., please wait\n\n");
+    //DebugLCD2.SetTopic("[AMC Skynet V29.03-2022]\nWaiting for new connections...\n\n");
+    DebugLCD2.Show();
+
+    // Connector Monitoring
+    ConnectorMonitor = new CConnectorMontoring(this);
+    ConnectorMonitor.RegisterCallback(ConnectorStatusChanged);
+
+    // Disassembler
+    Disassembler = new CDissassembler(this);
+
+    // Autobuilder
+    AutoBuilder = new CAutoBuilder(this, AutoBuilder_Comp_LCD, AutoBuilder_Ammo_LCD, AutoBuilder_Tool_LCD, Autobuilder_Msg);
+    AutoBuilder.Title_Components = $"[AMC HQ BadAI Component Autobuilder {HQ_Script_Version}]\n";
+    AutoBuilder.Title_Tools = $"[AMC HQ BadAI Tool Autobuilder {HQ_Script_Version}]\n";
+    AutoBuilder.Title_Ammunition = $"[AMC HQ BadAI Ammo Autobuilder {HQ_Script_Version}]\n";
+
+    // Connector Monitoring Light Control -> get rotaring lights
+    GridTerminalSystem.GetBlocksOfType<IMyReflectorLight>(RotatingLights, r => r.IsSameConstructAs(Me) && r.BlockDefinition.SubtypeId.StartsWith("Rot"));
+
+    StartAndLoopHQProcess(0, true);
+    Runtime.UpdateFrequency = UpdateFrequency.Update10;
+
+}
+
+
+
+
+public void Main(string argument, UpdateType updateSource)
+{
+    if ((updateSource & UpdateType.Terminal) != 0 || (updateSource & UpdateType.Trigger) != 0)
+    {
+        if (argument.Equals("teach"))
+            TeachHQCustomData();
+
+        return;
+    }
+
+    ConnectorMonitor.Update();
+    ThreadManager.Update();
+}
+
+void StartAndLoopHQProcess(long entityId, bool _success)
+{
+    // Create a new HQ Loop Process with new random threadId
+    Random rnd = new Random();
+    HQThreadId = rnd.Next();
+
+    ThreadManager.AddThread(HQThreadId, HQProcessLoop(), StartAndLoopHQProcess);   // Call itself to loop
+}
+
+
+IEnumerator<bool> HQProcessLoop()
+{
+    DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Start fetching blocks\n");
+    DebugLCD.Show();
+
+    IEnumerator<bool> FetchBlockEnumerator = Fetchblocks();
+
+    while(true)
+    {
+        if (!FetchBlockEnumerator.MoveNext())
+        {
+            FetchBlockEnumerator.Dispose();
+            break;
+        }
+        yield return true;
+    }
+
+    ProcessedItemCounter = 0;
+
+    for (int c=0; c<HQStorageBlocks.Count; c++)
+    {
+        CStorageBlock currentBlock = HQStorageBlocks[c];
+
+        if (!currentBlock.Owner.IsFunctional)
+            continue;
+
+        switch (currentBlock.Mode)
+        {
+            case StorageBlockMode.Storage:
+                {
+                    IEnumerator<bool> StorageEnumerator = StorageFunc(currentBlock);
+
+                    while (true)
+                    {
+                        if (!StorageEnumerator.MoveNext())
+                        {
+                            StorageEnumerator.Dispose();
+                            break;
+                        }
+
+                        yield return true;
+                    }
+
+                } break;
+
+
+            case StorageBlockMode.Clean:
+                {
+                    IEnumerator<bool> CleanEnumerator = CleanFunc(currentBlock);
+
+                    while (true)
+                    {
+                        if (!CleanEnumerator.MoveNext())
+                        {
+                            CleanEnumerator.Dispose();
+                            break;
+                        }
+
+                        yield return true;
+                    }
+
+                } break;
+
+
+            case StorageBlockMode.Fill:
+                {
+                    IEnumerator<bool> FillEnumerator = FillFunc(currentBlock);
+
+                    while (true)
+                    {
+                        if (!FillEnumerator.MoveNext())
+                        {
+                            FillEnumerator.Dispose();
+                            break;
+                        }
+
+                        yield return true;
+                    }
+
+                } break;
+
+            // Clean the inventory and fill it with required items
+            case StorageBlockMode.CleanAndFill:
+                {
+                    IEnumerator<bool> CleanAndFillEnumerator = CleanAndFillFunc(currentBlock);
+
+                    while (true)
+                    {
+                        if (!CleanAndFillEnumerator.MoveNext())
+                        {
+                            CleanAndFillEnumerator.Dispose();
+                            break;
+                        }
+
+                        yield return true;
+                    }
+                } break;
+
+            // Disassemble all items in this container
+            case StorageBlockMode.Disassemble:
+                {
+                    IEnumerator<bool> DisassembleEnumerator = DisassembleFunc(currentBlock);
+
+                    while (true)
+                    {
+                        if (!DisassembleEnumerator.MoveNext())
+                        {
+                            DisassembleEnumerator.Dispose();
+                            break;
+                        }
+
+                        yield return true;
+                    }
+                } break;
+
+            // Mark this assembler as autobuilder assembler, cleaning it also
+            case StorageBlockMode.Autobuilder:
+                {
+                    // Override Autobuilder to Cleaning first
+                    currentBlock.Mode = StorageBlockMode.Clean;
+
+                    IEnumerator<bool> CleanEnumerator = CleanFunc(currentBlock);
+
+                    while (true)
+                    {
+                        if (!CleanEnumerator.MoveNext())
+                        {
+                            CleanEnumerator.Dispose();
+                            break;
+                        }
+
+                        yield return true;
+                    }
+
+                    // Reset to autobuilding mode
+                    currentBlock.Mode = StorageBlockMode.Autobuilder;
+                    AutoBuilder.Assembler = currentBlock.Owner as IMyAssembler;
+
+                } break;
+
+
+            default:    // Ignore
+                break;
+        }
+    }
+
+
+    // Run the Autobuilder
+    while (!AutoBuilder.Update())
+        yield return true;
+
+    // Checking Medical Rooms and Connectors for ownership
+    CheckHQSecurity();
+
+    DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Process Loop complete - sleeping 100 ticks\n");
+    DebugLCD.Show();
+
+    for (int c = 0; c < 100; c++)
+        yield return true;
+}
+
+
+public void Autobuilder_Msg(string _msg)
+{
+    DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : {_msg}");
+    DebugLCD.Show();
+}
+
+
+
+bool MoveItemToInventory(MyInventoryItem _item, IMyInventory _sourceInventory, IMyInventory _destinationInventory, double _amount = -1)
+{
+    if (_destinationInventory.IsFull)
+        return false;
+
+    // Check if that inventory is connected and is able to hold that item type
+    if (!_sourceInventory.CanTransferItemTo(_destinationInventory, _item.Type))
+        return false;
+
+    if (_amount == -1)
+    {
+        return _sourceInventory.TransferItemTo(_destinationInventory, _item);
+    }
+    else
+    {
+        return _sourceInventory.TransferItemTo(_destinationInventory, _item, (MyFixedPoint)_amount);
+    }
+}
+
+
+void GetItemFromHQStorage(MyItemType _itemType, out IMyInventory _sourceInventory, out MyInventoryItem? item)
+{
+    item = null;
+    _sourceInventory = null;
+
+    // Get the inventories where this item can be stored
+    List<IMyInventory> sourceInventoryList = InventoryLookupTable?.GetInventoryList(_itemType);
+
+    // Check if there is at least one storge inventory
+    if (sourceInventoryList == null)
+        return;
+
+    foreach (IMyInventory sourceInventory in sourceInventoryList)
+    {
+        item = sourceInventory.FindItem(_itemType);
+
+        if (item.HasValue)
+        {
+            _sourceInventory = sourceInventory;
+            return;  // We found it, return
+        }
+    }
+
+    // Not found anything
+}
+
+
+bool MoveItemToHQ(MyInventoryItem _item, IMyInventory _sourceInventory, double _amount = -1)
+{
+    // Get the inventories where this item can be stored
+    List<IMyInventory> destInventoryList = InventoryLookupTable?.GetInventoryList(_item.Type);
+
+    // If we don't find any place where we could put this item into continue with next item
+    if (destInventoryList == null)
+        return false;
+
+    //  Try to move this item into one of the destination inventories
+    foreach (IMyInventory destInventory in destInventoryList)
+    {
+        if (destInventory.IsFull)
+            continue;
+
+        // Check if that inventory is connected and is able to hold that item type
+        if (!_sourceInventory.CanTransferItemTo(destInventory, _item.Type))
+            continue;
+
+        if (_amount == -1)  // We remove the whole stack, so we can count inventory slots to check successfull movement
+        {
+            // Workaround for not correctly working CanItemsBeAdded function from keen, Thanks Keen to not fixed it from 2015 to 2022
+            // https://forum.keenswh.com/threads/1-064-transferitemto-method-returns-true-even-if-transfer-failed-in-some-cases.7235474/
+            int itemCountBeforeMove = _sourceInventory.ItemCount;
+
+            _sourceInventory.TransferItemTo(destInventory, _item); // sometimes return true even if item not get moved, buggy shit, so double check
+
+            if (_sourceInventory.ItemCount < itemCountBeforeMove)
+                return true;
+        }
+        else
+        {
+            return _sourceInventory.TransferItemTo(destInventory, _item, (MyFixedPoint)_amount);
+        }
+
+        // Try again with the next inventory
+    }
+
+    return false;
+}
+
+
+IEnumerator<bool> StorageFunc(CStorageBlock _block)
+{
+    _block.UpdateItemList();
+
+    int itemCount = _block.ItemList.Count;
+    ProcessedItemCounter += itemCount;
+
+    if (itemCount != 0)
+    {
+        DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Processing {itemCount} items in '{_block.Owner.CustomName}'\n");
+        DebugLCD.Show();
+    }
+
+    yield return true;
+
+    for (int i = 0; i < itemCount; i++)
+    {
+        if (i + 1 % 20 == 0)    // Just for the case there were 30 conainsKey Checks without success
+            yield return true;
+
+        // Check if this item is allowed to stay in it's inventory
+        if (_block.CustomData.ContainsKey(_block.ItemList[i].Type))
+            continue;
+
+        MoveItemToHQ(_block.ItemList[i], _block.Inventory);
+        yield return true;
+    }
+}
+
+
+IEnumerator<bool> CleanAndFillFunc(CStorageBlock _block)
+{
+    IEnumerator<bool> job = CleanFunc(_block);
+
+    // Call Cleaning
+    while (true)
+    {
+        if (!job.MoveNext())
+        {
+            job.Dispose();
+            break;
+        }
+
+        yield return true;
+    }
+
+    // Call Filling
+    job = FillFunc(_block);
+
+    while (true)
+    {
+        if (!job.MoveNext())
+        {
+            job.Dispose();
+            break;
+        }
+
+        yield return true;
+    }
+}
+
+
+IEnumerator<bool> DisassembleFunc(CStorageBlock _block)
+{
+    _block.UpdateItemList();
+
+    int itemCount = _block.ItemList.Count;
+    ProcessedItemCounter += itemCount;
+
+    if (itemCount != 0)
+    {
+        DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Processing {itemCount} items in '{_block.Owner.CustomName}'\n");
+
+        if (itemCount > 50)
+            DebugLCD.Add($"-> be patient, this may take a while...\n");
+
+        DebugLCD.Show();
+    }
+
+    yield return true;
+
+
+    int disassemblyCounter = 0;
+
+
+    // if the assembler itself is marked with [disassemble] tag
+    if (_block.IsProductionBlock)
+    {
+        if (_block.Owner is IMyAssembler)
+        {
+            foreach (var item in _block.ItemList)
+            {
+                // Don't disassemble items which are not listed in CustomData
+                if (!_block.CustomData.ContainsKey(item.Type))
+                    continue;
+
+                if (Disassembler.DisassembleItem(_block.Inventory, item, (IMyAssembler)_block.Owner))   // Disassemble with this assembler
+                    disassemblyCounter++;
+
+                yield return true;
+            }
+        }
+    }
+    else
+    {
+        // Check each item in this cargo
+        foreach (var item in _block.ItemList)
+        {
+            // Don't disassemble items which are not listed in CustomData
+            if (!_block.CustomData.ContainsKey(item.Type))
+                continue;
+
+            if (Disassembler.DisassembleItem(_block.Inventory, item))
+                disassemblyCounter++;
+
+            yield return true;
+            yield return true;
+        }
+    }
+
+    // Reset to assembly Mode
+    Disassembler.ResetToAssemblyModeIfEmpty();
+
+    if (disassemblyCounter != 0)
+    {
+        DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Disassembled {disassemblyCounter} items in '{_block.Owner.CustomName}'\n");
+        DebugLCD.Show();
+    }
+}
+
+
+IEnumerator<bool> CleanFunc(CStorageBlock _block)
+{
+    if (_block.IsProductionBlock)
+    {
+        if (_block.Owner is IMyAssembler)
+        {
+            if (((IMyAssembler)(_block.Owner)).Mode == MyAssemblerMode.Disassembly)
+                yield break;
+        }
+    }
+
+    CDebugLCD _debugLCD;
+
+    if (_block.IsExternal)
+        _debugLCD = DebugLCD2;
+    else
+        _debugLCD = DebugLCD;
+
+    _block.UpdateItemList();
+
+    int itemCount = _block.ItemList.Count;
+    ProcessedItemCounter += itemCount;
+
+    if (itemCount != 0)
+    {
+        _debugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Cleaning {itemCount} items in '{_block.Owner.CustomName}'\n");
+
+        if (itemCount > 50)
+            _debugLCD.Add($"-> be patient, this may take a while...\n");
+
+        _debugLCD.Show();
+    }
+
+    yield return true;
+
+    if (_block.Mode == StorageBlockMode.Clean)
+    {
+        for (int i = 0; i < itemCount; i++)
+        {
+            MoveItemToHQ(_block.ItemList[i], _block.Inventory);
+            yield return true;
+        }
+    }
+    else if(_block.Mode == StorageBlockMode.CleanAndFill)
+    {
+        for (int i = 0; i < itemCount; i++)
+        {
+            // in CleanAndFill Mode do only clean if not needed
+            if (!_block.CustomData.ContainsKey(_block.ItemList[i].Type))
+            {
+                MoveItemToHQ(_block.ItemList[i], _block.Inventory);
+                yield return true;
+            }
+        }
+    }
+}
+
+
+IEnumerator<bool> FillFunc(CStorageBlock _block)
+{
+    _block.UpdateItemList();
+
+    CDebugLCD _debugLCD;
+
+    if (_block.IsExternal)
+        _debugLCD = DebugLCD2;
+    else
+        _debugLCD = DebugLCD;
+
+    int itemCount = _block.CustomData.Count;
+    ProcessedItemCounter += itemCount;
+
+
+    if (itemCount != 0)
+    {
+        _debugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Filling {itemCount} items in '{_block.Owner.CustomName}'\n");
+        _debugLCD.Show();
+    }
+
+    yield return true;
+
+
+    foreach (var ItemData in _block.CustomData)
+    {
+        double storedItemAmount = (double)_block.Inventory.GetItemAmount(ItemData.Key);
+        double requiredAmount = ItemData.Value - storedItemAmount;
+
+        if (requiredAmount == 0)
+        {
+            yield return true;
+            continue;
+        }
+
+        // Remove items because it's to much
+        if (requiredAmount < 0)
+        {
+            requiredAmount = -requiredAmount;   // turn negative required amount into positive
+
+            do
+            {
+                MyInventoryItem? foundIitem = _block.Inventory.FindItem(ItemData.Key);
+
+                if (!foundIitem.HasValue)
+                    break;
+
+                double foundItemAmount = (double)foundIitem.Value.Amount;
+
+                if (foundItemAmount >= requiredAmount)
+                {
+                    MoveItemToHQ(foundIitem.Value, _block.Inventory, requiredAmount);
+                    break;  // if this didn't work, the HQ must be full, just continue with next item
+                }
+                else // this item is not enough, we need remove more than one stack
+                {
+                    if (!MoveItemToHQ(foundIitem.Value, _block.Inventory, foundItemAmount))
+                        break;
+
+                    // Successfull transfered this item amount, so reduce the required amount
+                    requiredAmount -= foundItemAmount;
+                    yield return true;
+                }
+            } while (requiredAmount > 0);
+        }
+        else
+        {
+            do  // Refill some more of this item
+            {
+                MyInventoryItem? item;
+                IMyInventory sourceInventory;
+
+                GetItemFromHQStorage(ItemData.Key, out sourceInventory, out item);
+
+                if (!item.HasValue) // No item found, continue with next entry in customData
+                    break;
+
+                double foundItemAmount = (double)item.Value.Amount;
+
+                if (foundItemAmount > requiredAmount)
+                {
+                    MoveItemToInventory(item.Value, sourceInventory, _block.Inventory, requiredAmount);
+                    break;   // continue with next item
+                }
+                else // We not found enough items, lets move the found amount and try find more
+                {
+                    // fill this found amount and loop until we not find any more or required amount reached
+                    if (MoveItemToInventory(item.Value, sourceInventory, _block.Inventory, foundItemAmount))
+                    {
+                        requiredAmount -= foundItemAmount;
+                        yield return true;  // yield for the case we need to move 100 bottles, tools or any other non stackable item
+                    }
+                }
+
+            } while (requiredAmount != 0);
+        }
+
+        yield return true;  // yield after each item
+    }
+
+}
+
+
+
+// Read blocks and it's customData of the HQ
+IEnumerator<bool> Fetchblocks()
+{
+    HQStorageBlocks.Clear();
+
+    // Create a new temporary Lookuptable until its filled, then change it against the old
+    CLookupTable newLooupTable = new CLookupTable();
+
+    HQContainer.Clear();
+    HQGasTanks.Clear();
+    HQReactors.Clear();
+    HQRefineries.Clear();
+    HQConnectors.Clear();
+    HQAssemblers.Clear();
+    HQWelders.Clear();
+
+    GridTerminalSystem.GetBlocksOfType<IMyCargoContainer>(HQContainer, b => b.IsSameConstructAs(Me) && b.BlockDefinition.SubtypeId.EndsWith("ainer"));
+    yield return true;
+    yield return true;
+    yield return true;
+
+    GridTerminalSystem.GetBlocksOfType<IMyGasTank>(HQGasTanks, g => g.IsSameConstructAs(Me));
+    yield return true;
+    yield return true;
+
+    GridTerminalSystem.GetBlocksOfType<IMyReactor>(HQReactors, r => r.IsSameConstructAs(Me));
+    yield return true;
+
+    GridTerminalSystem.GetBlocksOfType<IMyRefinery>(HQRefineries, r => r.IsSameConstructAs(Me));
+    yield return true;
+
+    GridTerminalSystem.GetBlocksOfType<IMyShipConnector>(HQConnectors, r => r.IsSameConstructAs(Me));
+    yield return true;
+
+    GridTerminalSystem.GetBlocksOfType<IMyAssembler>(HQAssemblers, r => r.IsSameConstructAs(Me));
+    yield return true;
+
+    GridTerminalSystem.GetBlocksOfType<IMyShipWelder>(HQWelders, r => r.IsSameConstructAs(Me));
+    yield return true;
+
+    //DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Reading CustomData of {HQContainer.Count} container\n");
+    //DebugLCD.Show();
+
+    // Storage Mode
+    foreach (var container in HQContainer)
+    {
+        CStorageBlock storageblock = new CStorageBlock(container);
+        storageblock.ReadCustomData(this);
+
+        HQStorageBlocks.Add(storageblock);
+
+        // used for storing/receiving items
+        newLooupTable.Add(storageblock.CustomData, storageblock.Inventory);
+
+        yield return true;
+    }
+
+    yield return true;
+
+    DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Reading CustomData of {HQGasTanks.Count} tanks\n");
+    DebugLCD.Show();
+
+    // Storage Mode
+    foreach (var gastank in HQGasTanks)
+    {
+        CStorageBlock storageblock = new CStorageBlock(gastank);
+        storageblock.ReadCustomData(this);
+
+        HQStorageBlocks.Add(storageblock);
+
+        // used for storing/receiving items
+        newLooupTable.Add(storageblock.CustomData, storageblock.Inventory);
+
+        yield return true;
+    }
+
+
+    yield return true;
+
+
+    DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Reading CustomData of {HQAssemblers.Count} assemblers\n");
+    DebugLCD.Show();
+
+    // Clean Mode
+    foreach (var assembler in HQAssemblers)
+    {
+        CStorageBlock storageblock = new CStorageBlock(assembler, false);   // Use Output-Inventory
+        storageblock.ReadCustomData(this);
+
+        HQStorageBlocks.Add(storageblock);
+
+        // Allow this assembler inventory to get filled by the item sorter to disasemble the items
+        if(storageblock.Mode == StorageBlockMode.Disassemble)
+            newLooupTable.Add(storageblock.CustomData, storageblock.Inventory);
+
+        yield return true;
+    }
+
+    // At this point the lookup table content is valid
+    InventoryLookupTable = newLooupTable;
+    DebugLCD2.SetTopic($"[AMC Skynet {HQ_Script_Version}]\nSystem online - Waiting for new connections...\n\n");
+    DebugLCD2.Show();
+
+    yield return true;
+
+    DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Reading CustomData of {HQReactors.Count} reactors\n");
+    DebugLCD.Show();
+
+    // Fill Mode
+    foreach (var reactor in HQReactors)
+    {
+        CStorageBlock storageblock = new CStorageBlock(reactor);
+        storageblock.ReadCustomData(this);
+
+        HQStorageBlocks.Add(storageblock);
+
+        yield return true;
+    }
+
+    yield return true;
+
+    DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Reading CustomData of {HQRefineries.Count} refineries\n");
+    DebugLCD.Show();
+
+    // Clean Mode
+    foreach (var refinery in HQRefineries)
+    {
+        CStorageBlock storageblock = new CStorageBlock(refinery, false);    // see Constructor: Use output inventory
+        storageblock.ReadCustomData(this);
+
+        HQStorageBlocks.Add(storageblock);
+
+        yield return true;
+    }
+
+    yield return true;
+
+    DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Reading CustomData of {HQWelders.Count} welders\n");
+    DebugLCD.Show();
+
+    // Clean Mode
+    foreach (var welder in HQWelders)
+    {
+        CStorageBlock storageblock = new CStorageBlock(welder, false);    // see Constructor: Use output inventory
+        storageblock.ReadCustomData(this);
+
+        HQStorageBlocks.Add(storageblock);
+
+        //yield return true;
+    }
+
+    yield return true;
+
+    DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Reading CustomData of {HQConnectors.Count} connectors\n");
+    DebugLCD.Show();
+
+    // Clean Mode
+    foreach (var connector in HQConnectors)
+    {
+        CStorageBlock storageblock = new CStorageBlock(connector);
+        storageblock.ReadCustomData(this);
+
+        HQStorageBlocks.Add(storageblock);
+
+        //yield return true;
+    }
+
+    yield return true;
+
+    DebugLCD.Add($"{DateTime.UtcNow.ToLongTimeString()} : Fetch blocks complete. Processing {HQStorageBlocks.Count} Inventories\n");
+    DebugLCD.Show();
+}
+
+
+
+
+void TeachHQCustomData()
+{
+    foreach(var storageblock in HQStorageBlocks)
+    {
+        storageblock.WriteCustomData();
+    }
+}
+
+
+
+void ConnectorStatusChanged(IMyShipConnector _connector, MyShipConnectorStatus _lastStatus)
+{
+    if(_connector.Status == MyShipConnectorStatus.Connected)
+    {
+        if(InventoryLookupTable == null)
+        {
+            DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Skynet not ready, '{_connector.OtherConnector.CubeGrid.CustomName}' not get processed'\n");
+            DebugLCD2.Show();
+            return;
+        }
+
+
+        if (ThreadManager.ExistsThread(_connector.EntityId))
+            ThreadManager.KillThread(_connector.EntityId);
+
+
+        ThreadManager.AddThread(_connector.EntityId, ProcessNewConnectedShip(_connector), ShipProcessFinished); // Using EntityId as unique thread Id
+        ThreadManager.PauseThread(HQThreadId);  // Pause the HQ thread so speed up the process on the connected grid
+
+        ProcessedConnectors.Add(_connector.EntityId);
+
+        DebugLCD2.SetTopic($"[AMC Skynet {HQ_Script_Version}] - {ProcessedConnectors.Count} Tasks running\nSystem online - Waiting for new connections...\n\n");
+
+        DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : '{_connector.OtherConnector.CubeGrid.CustomName}' connected at '{_connector.CustomName}'\n");
+        DebugLCD2.Show();
+    }
+    else
+    {
+        // a grid disconnected
+        if (_lastStatus == MyShipConnectorStatus.Connected)
+        {
+            DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : '{_connector.OtherConnector.CubeGrid.CustomName}' disconnected at '{_connector.CustomName}'\n");
+            DebugLCD2.Show();
+
+            ThreadManager.KillThread(_connector.EntityId);  // this thread's callback get called and remove the thread is out of the ProcessedConnectorList
+            ProcessedConnectors.Remove(_connector.EntityId);
+        }
+
+        // Disable rotary lights
+        IMyReflectorLight rlight = null;
+
+        foreach (var light in RotatingLights)
+        {
+            double distance = Vector3D.DistanceSquared(light.Position, _connector.Position);
+            if (distance < 10)
+            {
+                rlight = light;
+                break;
+            }
+        }
+
+        // Found a rotatry light in range of that connector
+        if (rlight != null)
+            rlight.Enabled = false;
+    }
+
+    // When nothing get processed anymore, continue with HQ Process Loop
+    if (ProcessedConnectors.Count == 0)
+        ThreadManager.ContinueThread(HQThreadId);
+}
+
+       /*
+
+        IEnumerator<bool> ExtendPiston(string _pistonName, string _connectorName, string _doorName)
+        {
+            IMyPistonBase Piston = GridTerminalSystem.GetBlockWithName(_pistonName) as IMyPistonBase;
+            IMyShipConnector Connector = GridTerminalSystem.GetBlockWithName(_connectorName) as IMyShipConnector;
+            IMyAirtightHangarDoor Door = GridTerminalSystem.GetBlockWithName(_doorName) as IMyAirtightHangarDoor;
+
+            if (Piston == null || Connector == null || Door == null)
+                yield break;
+
+            Door.Enabled = true;
+
+            yield return true;
+
+            Door.OpenDoor();
+
+            // Wait for the door to be open
+            while (Door.OpenRatio < 0.6f)
+                yield return true;
+
+            Door.Enabled = false; // Disable door so it dont open > 1 block
+            Piston.Extend();
+
+            DateTime timeUntilTimedOut = DateTime.UtcNow + new TimeSpan(0,0,5);
+
+            while (Piston.CurrentPosition < (Piston.HighestPosition - 0.2f))
+            {
+                if (DateTime.UtcNow >= timeUntilTimedOut)
+                    break;
+
+                yield return true;
+            }
+
+            Connector.Enabled = true;
+        }
+
+        IEnumerator<bool> RetractPiston(string _pistonName, string _connectorName, string _doorName)
+        {
+            IMyPistonBase Piston = GridTerminalSystem.GetBlockWithName(_pistonName) as IMyPistonBase;
+            IMyShipConnector Connector = GridTerminalSystem.GetBlockWithName(_connectorName) as IMyShipConnector;
+            IMyAirtightHangarDoor Door = GridTerminalSystem.GetBlockWithName(_doorName) as IMyAirtightHangarDoor;
+
+            if (Piston == null || Connector == null || Door == null)
+                yield break;
+
+            Connector.Enabled = false;
+
+            yield return true;
+
+            Piston.Retract();
+
+            DateTime timeUntilTimedOut = DateTime.UtcNow + new TimeSpan(0, 0, 5);
+
+            // Wait for the piston to be inside before close the door
+            while (Piston.CurrentPosition > (Piston.LowestPosition + 0.2f))
+            {
+                if (DateTime.UtcNow >= timeUntilTimedOut)
+                    break;
+
+                yield return true;
+            }
+
+            Door.Enabled = true;
+            Door.CloseDoor();
+
+            yield return true;
+
+            // do it again, due SE bug / lag, whatever causes not to work
+            Door.CloseDoor();
+        }
+        */
+
+IEnumerator<bool> ProcessNewConnectedShip(object _connector)
+{
+    IMyShipConnector HQconnector = _connector as IMyShipConnector;
+    IMyShipConnector OtherConnector = HQconnector.OtherConnector;
+
+    List<CStorageBlock> storageBlocks = new List<CStorageBlock>();
+
+    // find nearest rotating light
+
+    IMyReflectorLight rlight = null;
+
+    foreach (var light in RotatingLights)
+    {
+        double distance = Vector3D.DistanceSquared(light.GetPosition(), HQconnector.GetPosition());
+        if (distance < 300)
+        {
+            rlight = light;
+            break;
+        }
+    }
+
+    // Found a rotatry light in range of that connector, activate it
+    if(rlight != null)
+        rlight.Enabled = true;
+
+    yield return true;
+
+
+    // Fetch blocks
+    DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Fetch blocks at '{OtherConnector.CubeGrid.CustomName}'\n");
+    DebugLCD2.Show();
+
+    List<IMyCargoContainer> containerList = new List<IMyCargoContainer>();
+    GridTerminalSystem.GetBlocksOfType<IMyCargoContainer>(containerList, c => c.CubeGrid.EntityId == OtherConnector.CubeGrid.EntityId);
+
+    for(int i=0;i<3;i++)
+        yield return true;
+
+    List<IMyShipConnector> connectorList = new List<IMyShipConnector>();
+    GridTerminalSystem.GetBlocksOfType<IMyShipConnector>(connectorList, c => c.CubeGrid.EntityId == OtherConnector.CubeGrid.EntityId);
+
+    for (int i = 0; i < 3; i++)
+        yield return true;
+
+    List<IMyReactor> reactorList = new List<IMyReactor>();
+    GridTerminalSystem.GetBlocksOfType<IMyReactor>(reactorList, c => c.CubeGrid.EntityId == OtherConnector.CubeGrid.EntityId);
+
+    for (int i = 0; i < 3; i++)
+        yield return true;
+
+    List<IMyCockpit>cockpitList = new List<IMyCockpit>();
+    GridTerminalSystem.GetBlocksOfType<IMyCockpit>(cockpitList, c => c.CubeGrid.EntityId == OtherConnector.CubeGrid.EntityId &&
+        (c.BlockDefinition.SubtypeId.StartsWith("LargeBlockCockpit") || c.BlockDefinition.SubtypeId.StartsWith("SmallBlockCockpit")));
+
+    for (int i = 0; i < 3; i++)
+        yield return true;
+
+    // read external container
+    DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Processing {containerList.Count} container at '{OtherConnector.CubeGrid.CustomName}'\n");
+    DebugLCD2.Show();
+    foreach (var container in containerList)
+    {
+        CStorageBlock newStorageBlock = new CStorageBlock(container);
+
+        DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Reading customData of {container.CustomName}'\n");
+        DebugLCD2.Show();
+
+        yield return true;
+
+        newStorageBlock.ReadCustomData(this);
+
+
+        DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Customdata of {container.CustomName} has {newStorageBlock.CustomData.Count} valid entries'\n");
+        DebugLCD2.Show();
+
+        yield return true;
+
+        if (newStorageBlock.Mode == StorageBlockMode.Fill || newStorageBlock.Mode == StorageBlockMode.Clean || newStorageBlock.Mode == StorageBlockMode.CleanAndFill || newStorageBlock.Mode == StorageBlockMode.TeachMode)
+        {
+            newStorageBlock.IsExternal = true;
+            storageBlocks.Add(newStorageBlock);
+        }
+    }
+
+    yield return true;
+
+    // Read external connectors
+    if (connectorList.Count != 0)
+    {
+        DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Processing {connectorList.Count} connectors at '{OtherConnector.CubeGrid.CustomName}'\n");
+        DebugLCD2.Show();
+    }
+
+    foreach (var connector in connectorList)
+    {
+        CStorageBlock newStorageBlock = new CStorageBlock(connector);
+
+        newStorageBlock.ReadCustomData(this);
+
+        if (newStorageBlock.Mode == StorageBlockMode.Fill || newStorageBlock.Mode == StorageBlockMode.Clean || newStorageBlock.Mode == StorageBlockMode.CleanAndFill || newStorageBlock.Mode == StorageBlockMode.TeachMode)
+        {
+            newStorageBlock.IsExternal = true;
+            storageBlocks.Add(newStorageBlock);
+            //yield return true; // no yield at connectors
+        }
+    }
+
+    yield return true;
+
+    // Read external reactors
+    if (reactorList.Count != 0)
+    {
+        DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Processing {reactorList.Count} reactors at '{OtherConnector.CubeGrid.CustomName}'\n");
+        DebugLCD2.Show();
+    }
+
+    foreach (var reactor in reactorList)
+    {
+        CStorageBlock newStorageBlock = new CStorageBlock(reactor);
+
+        newStorageBlock.ReadCustomData(this);
+
+        if (newStorageBlock.Mode == StorageBlockMode.Fill || newStorageBlock.Mode == StorageBlockMode.Clean || newStorageBlock.Mode == StorageBlockMode.CleanAndFill || newStorageBlock.Mode == StorageBlockMode.TeachMode)
+        {
+            newStorageBlock.IsExternal = true;
+            storageBlocks.Add(newStorageBlock);
+            yield return true;
+        }
+    }
+
+    yield return true;
+
+
+    // Read external cockpits
+    if (cockpitList.Count != 0)
+    {
+        DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Processing {cockpitList.Count} cockpits at '{OtherConnector.CubeGrid.CustomName}'\n");
+        DebugLCD2.Show();
+    }
+
+    foreach (var cockpit in cockpitList)
+    {
+        CStorageBlock newStorageBlock = new CStorageBlock(cockpit);
+
+        newStorageBlock.ReadCustomData(this);
+
+        if (newStorageBlock.Mode == StorageBlockMode.Fill || newStorageBlock.Mode == StorageBlockMode.Clean || newStorageBlock.Mode == StorageBlockMode.CleanAndFill || newStorageBlock.Mode == StorageBlockMode.TeachMode)
+        {
+            newStorageBlock.IsExternal = true;
+            storageBlocks.Add(newStorageBlock);
+            yield return true;
+        }
+    }
+
+    yield return true;
+    yield return true;
+    yield return true;
+
+    for (int c = 0; c < storageBlocks.Count; c++)
+    {
+        CStorageBlock currentBlock = storageBlocks[c];
+
+        switch (currentBlock.Mode)
+        {
+            case StorageBlockMode.Fill:
+                {
+                    IEnumerator<bool> FillEnumerator = FillFunc(currentBlock);
+
+                    while (true)
+                    {
+                        if (!FillEnumerator.MoveNext())
+                        {
+                            FillEnumerator.Dispose();
+                            break;
+                        }
+
+                         yield return true;
+                    }
+                }
+                break;
+
+            case StorageBlockMode.Clean:
+                {
+                    IEnumerator<bool> cleanEnumerator = CleanFunc(currentBlock);
+
+                    int i = 0;
+                    // Call Cleaning
+                    while (true)
+                    {
+                        if (!cleanEnumerator.MoveNext())
+                        {
+                            cleanEnumerator.Dispose();
+                            break;
+                        }
+
+                        i++;
+
+                        if (i % 5 == 0) // Clean 5 items before yield
+                            yield return true;
+                    }
+                }
+                break;
+
+            case StorageBlockMode.CleanAndFill:
+                {
+                    IEnumerator<bool> job = CleanFunc(currentBlock);
+
+                    // Call Cleaning
+                    while (true)
+                    {
+                        if (!job.MoveNext())
+                        {
+                            job.Dispose();
+                            break;
+                        }
+
+                        yield return true;
+                    }
+
+                    for (int i = 0; i < 10; i++)
+                        yield return true;
+
+                    // Call Filling
+                    job = FillFunc(currentBlock);
+
+                    while (true)
+                    {
+                        if (!job.MoveNext())
+                        {
+                            job.Dispose();
+                            break;
+                        }
+
+                        yield return true;
+                    }
+
+                }
+                break;
+
+            default:    // this should never happen, get sortet out before
+                break;
+        }
+    }
+}
+
+
+
+void ShipProcessFinished(long _threadId, bool _processCompleted)
+{
+    // Remove this connector out of the List so we know it has completed its job
+    ProcessedConnectors.Remove(_threadId);
+
+    DebugLCD2.SetTopic($"[AMC Skynet {HQ_Script_Version}] - {ProcessedConnectors.Count} Tasks running\nSystem online - Waiting for new connections...\n\n");
+
+    if (ProcessedConnectors.Count == 0)
+        ThreadManager.ContinueThread(HQThreadId);
+
+
+    //Find the connector with that threadId
+    List<IMyShipConnector> connectorList = new List<IMyShipConnector>();
+    GridTerminalSystem.GetBlocksOfType<IMyShipConnector>(connectorList, c => c.EntityId == _threadId);
+
+    if (connectorList.Count != 0)
+    {
+        if (_processCompleted)
+        {
+            DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Job '{connectorList.First().OtherConnector.CubeGrid.CustomName}' doooone'\n");
+            DebugLCD2.Show();
+        }
+        else
+        {
+            DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Processing '{connectorList.First().OtherConnector.CubeGrid.CustomName}' interrupted'\n");
+            DebugLCD2.Show();
+        }
+    }
+    else
+    {
+        DebugLCD2.Add($"{DateTime.UtcNow.ToLongTimeString()} : Connector problem found - Abort\n");
+    }
+
+
+    // Disable rotary lights
+    IMyReflectorLight rlight = null;
+
+    foreach (var light in RotatingLights)
+    {
+        double distance = Vector3D.DistanceSquared(light.GetPosition(), connectorList.First().GetPosition());
+        if (distance < 300)
+        {
+            rlight = light;
+            break;
+        }
+    }
+
+    // Found a rotatry light in range of that connector
+    if (rlight != null)
+        rlight.Enabled = false;
+}
+
+void CheckHQSecurity()
+{
+    List<IMyMedicalRoom> MedicalRooms = new List<IMyMedicalRoom>();
+    GridTerminalSystem.GetBlocksOfType<IMyMedicalRoom>(MedicalRooms, m => m.IsSameConstructAs(Me));
+
+    foreach(var medical in MedicalRooms)
+    {
+        if(!IsRelationshipOK(medical))
+        {
+            DebugLCD.Add("WARNING WARNING WARNING WARNING WARNING\n");
+            DebugLCD.Add($"Medical Room relationship {medical.CustomName} wrong\n");
+            DebugLCD.Add("WARNING WARNING WARNING WARNING WARNING\n");
+            DebugLCD.Show();
+        }
+    }
+
+    List<IMyShipConnector> connectors = new List<IMyShipConnector>();
+    GridTerminalSystem.GetBlocksOfType<IMyShipConnector>(connectors, m => m.IsSameConstructAs(Me));
+
+    foreach (var connector in connectors)
+    {
+        if (!IsRelationshipOK(connector))
+        {
+            DebugLCD.Add("WARNING WARNING WARNING WARNING WARNING\n");
+            DebugLCD.Add($"Connector relationship {connector.CustomName} wrong\n");
+            DebugLCD.Add("WARNING WARNING WARNING WARNING WARNING\n");
+            DebugLCD.Show();
+        }
+    }
+}
+
+
+public bool IsRelationshipOK(IMyTerminalBlock _block)
+{
+    // Check if connected connector is valid
+    MyRelationsBetweenPlayerAndBlock relation = _block.GetUserRelationToOwner(Me.OwnerId);
+
+    if (relation == MyRelationsBetweenPlayerAndBlock.Enemies || relation == MyRelationsBetweenPlayerAndBlock.Neutral || relation == MyRelationsBetweenPlayerAndBlock.NoOwnership)
+        return false;
+
+    return true;
+}
+
+class Autobuilder_Item
+{
+    public string SubTypeId;
+    public MyDefinitionId Blueprint;
+    public double AvailableAmount;
+    public double RequiredAmount;
+    public double AmountToProduce;
+    public bool IsVanillaItem;
+}
+
+
+/*
+        static Dictionary<string, string> Modded_Blueprint_Definitions = new Dictionary<string, string>()
+        {
+            {"EliteConstruction", "EliteConstruction" },
+            {"EliteDetector", "EliteDetector" },
+            {"EliteDisplay", "EliteDisplay" },
+            {"EliteLargeTube", "EliteLargeTube" },
+            {"EliteMetalGrid", "EliteMetalGrid" },
+            {"EliteMotor", "EliteMotor" },
+            {"ElitePowerCell", "ElitePowerCell" },
+            {"EliteReactor", "EliteReactor" },
+            {"EliteSmallTube", "EliteSmallTube" },
+            {"EliteSteelPlate", "EliteSteelPlate" },
+            {"EliteSuperconductor", "EliteSuperconductor" },
+            {"EnhancedConstruction", "EnhancedConstruction" },
+            {"EnhancedDetector", "EnhancedDetector" },
+            {"EnhancedDisplay", "EnhancedDisplay" },
+            {"EnhancedGravityGenerator", "EnhancedGravityGenerator" },
+            {"EnhancedInteriorPlate", "EnhancedInteriorPlate" },
+            {"EnhancedLargeTube", "EnhancedLargeTube" },
+            {"EnhancedMetalGrid", "EnhancedMetalGrid" },
+            {"EnhancedMotor", "EnhancedMotor" },
+            {"EnhancedPowerCell", "EnhancedPowerCell" },
+            {"EnhancedReactor", "EnhancedReactor" },
+            {"EnhancedSmallTube", "EnhancedSmallTube" },
+            {"EnhancedSteelPlate", "EnhancedSteelPlate" },
+            {"EnhancedSuperconductor", "EnhancedSuperconductor" },
+            {"ProficientConstruction", "ProficientConstruction" },
+            {"ProficientDisplay", "ProficientDisplay" },
+            {"ProficientInteriorPlate", "ProficientInteriorPlate" },
+            {"ProficientLargeTube", "ProficientLargeTube" },
+            {"ProficientMetalGrid", "ProficientMetalGrid" },
+            {"ProficientReactor", "ProficientReactor" },
+            {"ProficientSmallTube", "ProficientSmallTube" },
+            {"ProficientSteelPlate", "ProficientSteelPlate" },
+        };
+        */
+
+
+static Dictionary<string, string> Vanilla_Blueprint_Definitions = new Dictionary<string, string>()
+{
+    // MyItemType-Subtypeid / Blueprint_Definition -> Keen Fucked Up with some ItemIds,  Fix it
+
+    // Componennts
+    {"BulletproofGlass", "BulletproofGlass" },
+    {"Canvas", "Canvas" },
+    {"Computer", "ComputerComponent" },
+    {"Construction", "ConstructionComponent" },
+    {"Detector", "DetectorComponent" },
+    {"Display", "Display" },
+    {"Explosives", "ExplosivesComponent" },
+    {"Girder", "GirderComponent" },
+    {"GravityGenerator", "GravityGeneratorComponent" },
+    {"InteriorPlate", "InteriorPlate" },
+    {"LargeTube", "LargeTube" },
+    {"Medical", "MedicalComponent" },
+    {"MetalGrid", "MetalGrid" },
+    {"Motor", "MotorComponent" },
+    {"PowerCell", "PowerCell" },
+    {"RadioCommunication", "RadioCommunicationComponent" },
+    {"Reactor", "ReactorComponent" },
+    {"SmallTube", "SmallTube" },
+    {"SolarCell", "SolarCell" },
+    {"SteelPlate", "SteelPlate" },
+    {"Superconductor", "Superconductor" },
+    {"Thrust", "ThrustComponent" },
+
+
+    // Ammo
+    {"AutocannonClip", "AutocannonClip" },
+    {"AutomaticRifleGun_Mag_20rd", "AutomaticRifleGun_Mag_20rd" },
+    {"ElitePistolMagazine", "ElitePistolMagazine" },
+    {"LargeCalibreAmmo", "LargeCalibreAmmo" },
+    {"LargeRailgunAmmo", "LargeRailgunAmmo" },
+    {"MediumCalibreAmmo", "MediumCalibreAmmo" },
+    {"Missile200mm", "Missile200mm" },
+    {"NATO_25x184mm", "NATO_25x184mmMagazine" },
+    {"NATO_5p56x45mm", "NATO_5p56x45mm" },
+    {"RapidFireAutomaticRifleGun_Mag_50rd", "RapidFireAutomaticRifleGun_Mag_50rd" },
+    {"UltimateAutomaticRifleGun_Mag_30rd", "UltimateAutomaticRifleGun_Mag_30rd" },
+
+    // Tools
+    {"AngleGrinder4Item", "AngleGrinder4" }, {"HandDrill4Item", "HandDrill4"}, {"Welder4Item", "Welder4"}, {"AngleGrinder2Item", "AngleGrinder2"},
+    {"HandDrill2Item", "HandDrill2" }, {"Welder2Item", "Welder2"}, {"AngleGrinderItem", "AngleGrinder"}, {"HandDrillItem", "HandDrill"},
+    {"AutomaticRifleItem", "AutomaticRifle" }, {"UltimateAutomaticRifleItem", "UltimateAutomaticRifle"}, {"RapidFireAutomaticRifleItem", "RapidFireAutomaticRifle"},
+    {"PreciseAutomaticRifleItem", "PreciseAutomaticRifle" }, {"AdvancedHandHeldLauncherItem", "AdvancedHandHeldLauncher"}, {"AngleGrinder3Item", "AngleGrinder3"},
+    {"HandDrill3Item", "HandDrill3" }, {"Welder3Item", "Welder3"}, {"BasicHandHeldLauncherItem", "BasicHandHeldLauncher"}, {"SemiAutoPistolItem", "SemiAutoPistol"},
+    {"ElitePistolItem", "ElitePistol" }, {"FullAutoPistolItem", "FullAutoPistol"}, {"WelderItem", "Welder"},
+};
+
+
+class CAutoBuilder
+{
+    public CAutoBuilder(Program _program, string _ComponentLCDName, string _AmmunitionLCDName, string _ToolLCDName, Action<string> _debugOutput = null)
+    {
+        program = _program;
+        LCD_Components = _program.GridTerminalSystem.GetBlockWithName(_ComponentLCDName) as IMyTextPanel;
+        LCD_Ammunition = _program.GridTerminalSystem.GetBlockWithName(_AmmunitionLCDName) as IMyTextPanel;
+        LCD_Tools = _program.GridTerminalSystem.GetBlockWithName(_ToolLCDName) as IMyTextPanel;
+
+        // Setup Debug output
+        if (_debugOutput == null)
+            DebugOutputDelegate = DefaultDebugOutput;
+        else
+            DebugOutputDelegate = _debugOutput;
+
+        // LCD Setup
+        Color FontColor = new Color(247, 106, 17);
+        ContentType Content = ContentType.TEXT_AND_IMAGE;
+        string Font = "Monospace";
+
+        if (LCD_Components == null)
+        {
+            DebugOutputDelegate($"LCD '{_ComponentLCDName}' not found\n");
+        }
+        else
+        {
+            LCD_Components.Font = Font;
+            LCD_Components.FontColor = FontColor;
+            LCD_Components.ContentType = Content;
+        }
+
+        if (LCD_Ammunition == null)
+        {
+            DebugOutputDelegate($"LCD '{_AmmunitionLCDName}' not found\n");
+        }
+        else
+        {
+            LCD_Ammunition.Font = Font;
+            LCD_Ammunition.FontColor = FontColor;
+            LCD_Ammunition.ContentType = Content;
+        }
+
+
+        if (LCD_Tools == null)
+        {
+            DebugOutputDelegate($"LCD '{_ToolLCDName}' not found\n");
+        }
+        else
+        {
+            LCD_Tools.Font = Font;
+            LCD_Tools.FontColor = FontColor;
+            LCD_Tools.ContentType = Content;
+        }
+
+        StateMachine = Autobuilder_ProcessLoop();
+    }
+
+    void DefaultDebugOutput(string _msg)
+    {
+        program.Echo(_msg);
+    }
+
+
+
+
+    // Create Blueprint Definition by subtypeId
+    MyDefinitionId? CreateDefinitionId(string _subTypeId)
+    {
+        MyDefinitionId id;
+
+        if (MyDefinitionId.TryParse($"MyObjectBuilder_BlueprintDefinition/{_subTypeId}", out id))
+            return id;
+
+        return null;
+    }
+
+
+    /// <summary>
+            /// Runs the Autobuilder
+            /// </summary>
+            /// <returns>true if Autobuilder-Process finished, false if not</returns>
+    public bool Update()
+    {
+        if(!StateMachine.MoveNext())
+        {
+            StateMachine.Dispose();
+            StateMachine = Autobuilder_ProcessLoop();
+            return true;
+        }
+
+        return false;
+    }
+
+
+    IEnumerator<bool> Autobuilder_ProcessLoop()
+    {
+        if (Assembler == null || !Assembler.IsFunctional)
+            yield break;
+
+        DebugOutputDelegate($"Starting Autobuilder...\n");
+
+        yield return true;
+
+        List<IMyTerminalBlock> blocklist = new List<IMyTerminalBlock>();
+        List<IMyInventory> inventorylist = new List<IMyInventory>();
+
+        program.GridTerminalSystem.GetBlocks(blocklist);
+
+        yield return true;
+
+        DebugOutputDelegate($"Checking {blocklist.Count} blocks...\n");
+
+        for (int i=0; i<5; i++)
+            yield return true;
+
+        // Get all inventories
+        foreach(var block in blocklist)
+        {
+            if (!block.HasInventory)
+                continue;
+
+            if (block.CubeGrid.EntityId != program.Me.CubeGrid.EntityId)    // fast version of IsSameConstructAsMe
+                continue;
+
+            for(int c=0; c<block.InventoryCount; c++)
+            {
+                inventorylist.Add(block.GetInventory(c));
+            }
+        }
+
+        yield return true;
+
+        DebugOutputDelegate($"Parsing {inventorylist.Count} inventories...\n");
+
+        // Clear the database
+        AvailableComponents.Clear();
+        AvailableTools.Clear();
+        AvailableAmmunition.Clear();
+
+
+        // Collect all items
+        List<MyInventoryItem> itemList = new List<MyInventoryItem>();
+        foreach (var inventory in inventorylist)
+        {
+            if (inventory.ItemCount == 0)
+                continue;
+
+            // Get items of this inventory
+            itemList.Clear();
+            inventory.GetItems(itemList);
+
+            // Sort the items into correct DataBase dependend of the type
+            foreach(var item in itemList)
+            {
+                MyItemInfo itemInfo = item.Type.GetItemInfo();
+
+                if (itemInfo.IsComponent)
+                {
+                    if (!AvailableComponents.ContainsKey(item.Type.SubtypeId))
+                    {
+                        AvailableComponents.Add(item.Type.SubtypeId, (double)item.Amount);
+                        continue;
+                    }
+
+                    AvailableComponents[item.Type.SubtypeId] += (double)item.Amount;
+                    continue;
+                }
+
+                if (itemInfo.IsTool)
+                {
+                    if (!AvailableTools.ContainsKey(item.Type.SubtypeId))
+                    {
+                        AvailableTools.Add(item.Type.SubtypeId, (double)item.Amount);
+                        continue;
+                    }
+
+                    AvailableTools[item.Type.SubtypeId] += (double)item.Amount;
+                    continue;
+                }
+
+                if (itemInfo.IsAmmo)
+                {
+                    if (!AvailableAmmunition.ContainsKey(item.Type.SubtypeId))
+                    {
+                        AvailableAmmunition.Add(item.Type.SubtypeId, (double)item.Amount);
+                        continue;
+                    }
+
+                    AvailableAmmunition[item.Type.SubtypeId] += (double)item.Amount;
+                    continue;
+                }
+            }
+
+            yield return true;  // Yield after each inventory
+        }
+
+        DebugOutputDelegate($"Found {AvailableComponents.Count} different items\n");
+
+        // Reading all storages and collecing items and it's amount is completed at this point
+
+
+        // Reading the Assembler queue
+        UpdateAssemblerQueue();
+        yield return true;
+
+
+        // Process Components
+        if(LCD_Components != null)
+        {
+            // Read the component lcd
+            Dictionary<string, double> RequiredComponents = GetRequiredAmountOfLCD(LCD_Components);
+
+            yield return true;
+
+            // Combine required components with available components
+            List<Autobuilder_Item> Items = CreateItemsList(RequiredComponents, AvailableComponents);
+
+            for (int i = 0; i < 3; i++)
+                yield return true;
+
+            // Draw it on the LCD
+            DrawLCD(LCD_Components, Title_Components, Items);
+
+            yield return true;
+
+            // Build it
+            Build(Items);
+
+            for (int i = 0; i < 3; i++)
+                yield return true;
+        }
+
+
+        // Process Tools
+        if (LCD_Tools != null)
+        {
+            // Read the component lcd
+            Dictionary<string, double> RequiredTools = GetRequiredAmountOfLCD(LCD_Tools);
+
+            yield return true;
+
+            // Combine required components with available components
+            List<Autobuilder_Item> Items = CreateItemsList(RequiredTools, AvailableTools);
+
+            for (int i = 0; i < 3; i++)
+                yield return true;
+
+            // Draw it on the LCD
+            DrawLCD(LCD_Tools, Title_Tools, Items);
+
+            yield return true;
+
+            // Build it
+            Build(Items);
+
+            for (int i = 0; i < 3; i++)
+                yield return true;
+        }
+
+
+        // Process Ammunition
+        if (LCD_Ammunition != null)
+        {
+            // Read the component lcd
+            Dictionary<string, double> RequiredAmmunition = GetRequiredAmountOfLCD(LCD_Ammunition);
+
+            yield return true;
+
+            // Combine required components with available components
+            List<Autobuilder_Item> Items = CreateItemsList(RequiredAmmunition, AvailableAmmunition);
+
+            for (int i = 0; i < 3; i++)
+                yield return true;
+
+            // Draw it on the LCD
+            DrawLCD(LCD_Ammunition, Title_Ammunition, Items);
+
+            yield return true;
+
+            // Build it
+            Build(Items);
+
+            for (int i = 0; i < 3; i++)
+                yield return true;
+        }
+    }
+
+
+    /* Debugging
+            string GetCustomData(List<Autobuilder_Item> _items)
+            {
+                StringBuilder s = new StringBuilder(2048);
+
+                foreach (var item in _items)
+                {
+                    s.AppendLine("{\"" + item.SubTypeId + "\", \"" + item.Blueprint.SubtypeName + "\" },");
+                }
+
+                return s.ToString();
+            }*/
+
+
+    // Build the missing items
+    void Build(List<Autobuilder_Item> _items)
+    {
+        if (Assembler == null)
+            return;
+
+        foreach(var item in _items)
+        {
+            if (item.AmountToProduce == 0)
+                continue;
+
+            // Check if that item is allready in queue, so only add to queue if missing and not queued
+            if (QueuedItems.ContainsKey(item.Blueprint))
+                continue;
+
+            if (!Assembler.CanUseBlueprint(item.Blueprint))
+            {
+                DebugOutputDelegate($"{Assembler.CustomName} can't use blueprint '{item.Blueprint.ToString()}'\n");
+                continue;
+            }
+
+            Assembler.AddQueueItem(item.Blueprint, item.AmountToProduce);
+
+            DebugOutputDelegate($"Adding {item.AmountToProduce} {item.Blueprint.SubtypeId} into assembly queue\n");
+        }
+    }
+
+
+
+
+    // Return a dictionary with blueprints and it's amount in the assembler queue
+    void UpdateAssemblerQueue()
+    {
+        DebugOutputDelegate($"Reading current Assembler queue\n");
+
+        QueuedItems.Clear();
+        TempAssemblerQueueList.Clear();
+
+        Assembler.GetQueue(TempAssemblerQueueList);
+
+        foreach(var item in TempAssemblerQueueList)
+        {
+            if (!QueuedItems.ContainsKey(item.BlueprintId))
+                QueuedItems.Add(item.BlueprintId, 0);
+
+            QueuedItems[item.BlueprintId] += (double)item.Amount;
+        }
+    }
+
+
+
+    // Create an List with combines required items and available items
+    List<Autobuilder_Item> CreateItemsList(Dictionary<string, double> _requiredList, Dictionary<string, double> _availableList)
+    {
+        _requiredList.Remove("ZoneChip");
+        _availableList.Remove("ZoneChip");
+
+        List<Autobuilder_Item> items = new List<Autobuilder_Item>();
+
+        // Check what need to be build
+        foreach (var item in _requiredList)
+        {
+            // Create a new Item
+            Autobuilder_Item newItem = new Autobuilder_Item();
+
+            newItem.RequiredAmount = item.Value; // set the required Amount
+            newItem.AvailableAmount = 0;
+            newItem.SubTypeId = item.Key;
+
+            MyDefinitionId? defId;
+
+            // Translator Keen's Fuck to BlueprintDefinition (MyItemType Mapping to BlueprintDefinition)
+            if (Vanilla_Blueprint_Definitions.ContainsKey(item.Key))
+            {
+                newItem.IsVanillaItem = true;
+                defId = CreateDefinitionId(Vanilla_Blueprint_Definitions[item.Key]);
+            }
+            else
+            {
+                defId = CreateDefinitionId(newItem.SubTypeId);
+            }
+
+
+            if(!defId.HasValue)
+            {
+                DebugOutputDelegate($"Can't create definition id with '{newItem.SubTypeId} 'from '_requiredList'\n");
+                continue;
+            }
+
+            newItem.Blueprint = defId.Value;    // Seems to be a valid blueprint, save it
+
+            // We got this item available
+            if (_availableList.ContainsKey(item.Key))
+                newItem.AvailableAmount = _availableList[item.Key];
+
+            // Calculate the amount of items need to be build
+            newItem.AmountToProduce = newItem.RequiredAmount - newItem.AvailableAmount;
+
+            // Check if we allready have the required amount in queue
+            if (QueuedItems.ContainsKey(newItem.Blueprint))
+                newItem.AmountToProduce -= QueuedItems[newItem.Blueprint];  // reduce by the amount of queued amount
+
+            // Check if we allready have enough
+            if (newItem.AmountToProduce < 0)
+                newItem.AmountToProduce = 0;
+
+            // Add it to the item List
+            items.Add(newItem);
+        }
+
+        // Add the available items which not listed in the requirement list
+        foreach(var item in _availableList)
+        {
+            // Check if the available item is written in the itemlist, if not, add it with zero requirement
+            if(!_requiredList.ContainsKey(item.Key))
+            {
+                Autobuilder_Item newItem = new Autobuilder_Item();
+                newItem.SubTypeId = item.Key;
+                newItem.RequiredAmount = 0;
+                newItem.AvailableAmount = _availableList[item.Key];
+                newItem.AmountToProduce = 0;
+
+                MyDefinitionId? defId;
+
+                // Translator Keen's Fuck to BlueprintDefinition (MyItemType Mapping to BlueprintDefinition)
+                if (Vanilla_Blueprint_Definitions.ContainsKey(item.Key))
+                {
+                    newItem.IsVanillaItem = true;
+                    defId = CreateDefinitionId(Vanilla_Blueprint_Definitions[item.Key]);
+                }
+                else
+                {
+                    defId = CreateDefinitionId(newItem.SubTypeId);
+                }
+
+                if (!defId.HasValue)
+                {
+                    DebugOutputDelegate($"Can't create definition id with '{newItem.SubTypeId} 'from 'AvailableComponents'\n");
+                    continue;
+                }
+
+                items.Add(newItem);
+            }
+        }
+
+        return items;
+    }
+
+
+    // Return a dicionary with subTypeId and Amount Dictionary of required items from this lcd panel
+    Dictionary<string, double> GetRequiredAmountOfLCD(IMyTextPanel _panel)
+    {
+        Dictionary<string, double> LCDitems = new Dictionary<string, double>();
+
+        LCDData.Clear();
+        _panel.ReadText(LCDData);
+
+        string[] lines = LCDData.ToString().Split('\n');
+        int lineCount = lines.Count();
+
+        string subTypeName = "";
+        double requiredAmount = 0;
+
+        for (int c = 1; c < lineCount; c++)  // Remove first line (topic)
+        {
+            lines[c] = lines[c].Trim();
+
+            if (lines[c].Length == 0)
+                continue;
+
+            // SubTypeName [ 1000 / 1000 ]
+            string[] dataPair = lines[c].Split('[');
+
+            if (dataPair.Count() != 2)
+                continue;
+
+            subTypeName = dataPair[0].Trim();
+            string[] amountPair = dataPair[1].Replace("]", "").Split('/');
+
+            if (amountPair.Count() != 2)
+                continue;
+
+            if (!double.TryParse(amountPair[0], out requiredAmount))
+                continue;
+
+            // Put into dictionary
+            if (!LCDitems.ContainsKey(subTypeName))
+            {
+                LCDitems.Add(subTypeName, requiredAmount);
+                continue;
+            }
+
+            // Allready existing, just update requested amount
+            LCDitems[subTypeName] += requiredAmount;
+        }
+
+        return LCDitems;
+    }
+
+    // Draw an item list to the LCD
+    void DrawLCD(IMyTextPanel _panel, string _title, List<Autobuilder_Item> _itemList)
+    {
+        if (_panel == null)
+            return;
+
+        LCDData.Clear();
+        LCDData.AppendLine($"{_title, 49}");
+
+        //foreach (var item in _itemList.OrderBy(o => o.SubTypeId).ThenBy(o => o.IsVanillaItem))
+        foreach (var item in _itemList.OrderBy(o => !o.IsVanillaItem).ThenBy(o => o.SubTypeId))
+        {
+            LCDData.AppendLine($"{item.SubTypeId, 28} [{item.RequiredAmount.ToString("F0"),7} / {item.AvailableAmount.ToString("F0"),-7}]");
+        }
+
+        _panel.WriteText(LCDData);
+    }
+
+
+    public string Title_Components { set; get; }
+    public string Title_Ammunition { set; get; }
+    public string Title_Tools { set; get; }
+    public IMyAssembler Assembler { get; set; }
+
+    Action<string> DebugOutputDelegate;
+
+    Dictionary<string, double> AvailableComponents = new Dictionary<string, double>();
+    Dictionary<string, double> AvailableTools = new Dictionary<string, double>();
+    Dictionary<string, double> AvailableAmmunition = new Dictionary<string, double>();
+
+    Dictionary<MyDefinitionId, double> QueuedItems = new Dictionary<MyDefinitionId, double>();
+    List<MyProductionItem> TempAssemblerQueueList = new List<MyProductionItem>();
+
+    //List<IMyAssembler> VanillaAssemberList = new List<IMyAssembler>();
+    //List<IMyAssembler> ModdedAssemblerList = new List<IMyAssembler>();
+
+    IEnumerator<bool> StateMachine = null;
+
+    IMyTextPanel LCD_Components;
+    IMyTextPanel LCD_Ammunition;
+    IMyTextPanel LCD_Tools;
+
+    StringBuilder LCDData = new StringBuilder(2048);
+    Program program;
+}
+
+class MonitoringConnector
+{
+    public IMyShipConnector Connector;
+    public MyShipConnectorStatus LastStatus = MyShipConnectorStatus.Connectable;
+}
+
+public class CConnectorMontoring
+{
+	public CConnectorMontoring(Program _program)
+    {
+        List<IMyShipConnector> connectors = new List<IMyShipConnector>();
+
+        _program.GridTerminalSystem.GetBlocksOfType<IMyShipConnector>(connectors, c => c.CubeGrid.EntityId == _program.Me.CubeGrid.EntityId);
+
+        foreach(var connector in connectors)
+        {
+            MonitoringConnector newConnector = new MonitoringConnector() { Connector = connector, LastStatus = connector.Status };
+            ConnectorList.Add(newConnector);
+        }
+    }
+
+
+    public void RegisterCallback(Action<IMyShipConnector, MyShipConnectorStatus> _statusChanged)
+    {
+        StatusChangedDelegate += _statusChanged;
+    }
+
+
+
+
+    public void Update()
+    {
+        foreach(var connector in ConnectorList)
+        {
+            if (connector.Connector.Status != connector.LastStatus)
+            {
+                StatusChangedDelegate.Invoke(connector.Connector, connector.LastStatus);  // Invoke registered callbacks
+
+                connector.LastStatus = connector.Connector.Status;  // Update Status
+            }
+        }
+    }
+
+    List<MonitoringConnector> ConnectorList = new List<MonitoringConnector>();
+    Action<IMyShipConnector, MyShipConnectorStatus> StatusChangedDelegate;
+}
+
+public class CDebugLCD
+{
+	public CDebugLCD(Program _program, string _name, int _maxLines = 20)
+	{
+		m_Program = _program;
+		MaxLineCount = _maxLines;
+
+		m_Panel = m_Program.GridTerminalSystem.GetBlockWithName(_name) as IMyTextPanel;
+
+		if (m_Panel != null)
+			m_Panel.ContentType = ContentType.TEXT_AND_IMAGE;
+	}
+
+
+	public void Add(string _string)
+	{
+		LineCounter++;
+		DebugLines += _string;	// Add the new text on the end
+
+		// Max Lines reached, remove the first line
+		if (LineCounter >= MaxLineCount)
+		{
+			int newLineSignPosition = DebugLines.IndexOf('\n'); // Get position of the first \n
+			DebugLines = DebugLines.Remove(0, newLineSignPosition+1); // Remove the first Line inclusive the not counted '\n'
+
+			LineCounter = MaxLineCount; // From now on we need to remove always the first line
+		}
+	}
+
+	public void SetTopic(string _string)
+    {
+		UseTopic = true;
+		Topic = _string;
+    }
+
+	public void Clear()
+	{
+		DebugLines = "";
+		LineCounter = 0;
+	}
+
+	public void Show()
+	{
+		if(UseTopic)
+			m_Panel?.WriteText(Topic+DebugLines);
+		else
+			m_Panel?.WriteText(DebugLines);
+	}
+
+	int MaxLineCount;
+	int LineCounter;
+	bool UseTopic = false;
+	string Topic;
+	string DebugLines;
+
+	Program m_Program;
+	IMyTextPanel m_Panel = null;
+}
+
+public class CDissassembler
+{
+    public CDissassembler(Program _program)
+    {
+        program = _program;
+        FetchAssemblerBlocks();
+    }
+
+
+    public void FetchAssemblerBlocks()
+    {
+        AssemblerList.Clear();
+        program.GridTerminalSystem.GetBlocksOfType<IMyAssembler>(AssemblerList, a => a.IsSameConstructAs(program.Me));
+    }
+
+
+    public bool DisassembleItem(IMyInventory _sourceInventory, MyInventoryItem _item, IMyAssembler _assembler = null)
+    {
+        MyDefinitionId? blueprint = GetMyDefinitionId(_item.Type);
+
+        if (!blueprint.HasValue)
+        {
+            program.Me.CustomData += $"Create Blueprint error\n";
+            return false;
+        }
+
+        IMyAssembler disassembler;
+
+        // Find an assembler which is able to disassemble this item
+        if (_assembler == null)
+            disassembler = GetAssembler(blueprint.Value);
+        else
+            disassembler = _assembler;
+
+
+        if (disassembler == null)
+        {
+            program.Me.CustomData += $"No free assembler found\n";
+            return false;
+        }
+
+        // Check if the item is not allready placed in this assembler, if it's not, move it there
+        if (disassembler.OutputInventory != _sourceInventory)
+        {
+            // Check if we can move the item to the assembler
+            if (!_sourceInventory.CanTransferItemTo(disassembler.OutputInventory, _item.Type))
+            {
+                program.Me.CustomData += $"Can't transfer item  in '{disassembler.CustomName}' inventory\n";
+                return false;
+            }
+
+            // Try to move the item which should be disassembled into the assembler
+            if (!_sourceInventory.TransferItemTo(disassembler.OutputInventory, _item))
+            {
+                program.Me.CustomData += $"{_item.Type} tranfer to '{disassembler.CustomName}' failed\n";
+                return false;
+            }
+        }
+
+        // Activate Disassembling Mode
+        disassembler.Mode = MyAssemblerMode.Disassembly;
+
+        // Add the blueprint to the disassembly queue
+        disassembler.AddQueueItem(blueprint.Value, _item.Amount);
+
+        // Enable Assembler if needed
+        if (!disassembler.Enabled)
+            disassembler.Enabled = true;
+
+        return true;
+    }
+
+
+    MyDefinitionId? GetMyDefinitionId(MyItemType _type)
+    {
+        MyDefinitionId id;
+        string subTypeItemConvertedToBlueprint = _type.SubtypeId;
+
+        if(_type.TypeId.EndsWith("PhysicalGunObject"))
+            // SubTypeId of PhysicalGunObject alsways ends with "item", but it's usasble blueprint without "item"
+            subTypeItemConvertedToBlueprint = _type.SubtypeId.Substring(0, _type.SubtypeId.Length - 4);
+
+        if (MyDefinitionId.TryParse($"MyObjectBuilder_BlueprintDefinition/{subTypeItemConvertedToBlueprint}", out id))
+            return id;
+
+        return null;
+    }
+
+
+    // Set the Mode to Assemble when the disassemble Queue is empty
+    public void ResetToAssemblyModeIfEmpty()
+    {
+        foreach(var assembler in AssemblerList)
+        {
+            if (assembler.Mode == MyAssemblerMode.Disassembly && assembler.IsQueueEmpty)
+                assembler.Mode = MyAssemblerMode.Assembly;
+        }
+    }
+
+    IMyAssembler GetAssembler(MyDefinitionId _id)
+    {
+        foreach (var assembler in AssemblerList)
+        {
+            if (assembler == null || !assembler.IsFunctional || assembler.OutputInventory.IsFull)
+                continue;
+
+            if (assembler.CanUseBlueprint(_id))
+                return assembler;
+
+            program.Me.CustomData += $"{assembler.CustomName} can't use blueprint '{_id}'\n";
+        }
+
+        return null;
+    }
+
+
+    Program program;
+    List<IMyAssembler> AssemblerList = new List<IMyAssembler>();
+}
+
+
+/* IMyInteriorLight =
+    MyObjectBuilder_InteriorLight/SmallLight
+    MyObjectBuilder_InteriorLight/SmallBlockSmallLight
+    MyObjectBuilder_InteriorLight/LargeBlockLight_1corner
+    MyObjectBuilder_InteriorLight/LargeBlockLight_2corner
+    MyObjectBuilder_InteriorLight/SmallBlockLight_1corner
+    MyObjectBuilder_InteriorLight/SmallBlockLight_2corner
+	*/
+
+
+/* IMyReflectorLight =
+
+    MyObjectBuilder_ReflectorLight/LargeBlockFrontLight
+    MyObjectBuilder_ReflectorLight/SmallBlockFrontLight
+    MyObjectBuilder_ReflectorLight/RotatingLightLarge
+    MyObjectBuilder_ReflectorLight/RotatingLightSmall
+
+	*/
+
+public class CRotatingLight
+{
+    public CRotatingLight(Program _program, string _blockname, bool _defaultOn = false)
+    {
+        m_Program = _program;
+		m_Name = _blockname;
+
+		m_Light = m_Program.GridTerminalSystem.GetBlockWithName(_blockname) as IMyReflectorLight;
+
+		if (m_Light == null)
+			return;
+
+		if (_defaultOn)
+			Enabled = true;
+		else
+			Enabled = false;
+    }
+
+	public void SetColor(byte r, byte g, byte b)
+	{
+		if(m_Light != null)
+			m_Light.Color = new Color(r, g, b);
+	}
+
+    public bool Enabled
+	{
+		get
+		{
+			return m_Light.Enabled;
+		}
+		set
+		{
+			m_Light.Enabled = value;
+		}
+	}
+
+
+
+	IMyReflectorLight	m_Light = null;
+	string				m_Name;
+    Program         	m_Program;
+}
+
+enum StorageBlockMode
+{
+    Storage, Fill, Clean, CleanAndFill, Ignore, Disassemble, TeachMode, Autobuilder, NotDefined
+}
+
+
+class CStorageBlock
+{
+    public CStorageBlock(IMyTerminalBlock _block, bool _useFirstInventory = true)
+    {
+        Owner = _block;
+
+        if (!_useFirstInventory && _block.InventoryCount > 1)
+        {
+            if (_block is IMyProductionBlock)    //  Need this workaround because GetInventory(1) dont return the Output Inventory
+            {
+                Inventory = ((IMyProductionBlock)_block).OutputInventory;
+                IsProductionBlock = true;
+            }
+            else
+            {
+                Inventory = _block.GetInventory();  // if something strange happen (unknown mod/block) just use  the first inventory instead risk a crash
+            }
+        }
+        else
+        {
+            Inventory = _block.GetInventory();
+        }
+
+    }
+
+
+    public IMyTerminalBlock Owner;
+    public IMyInventory Inventory;
+    public StorageBlockMode Mode;
+    public bool IsExternal = false;
+    public bool IsProductionBlock = false;
+
+    public Dictionary<MyItemType, MyFixedPoint> CargoContent = new Dictionary<MyItemType, MyFixedPoint>();  // Counted Items, if UpdateCargoContent called with countItem=true
+    public Dictionary<MyItemType, double> CustomData = new Dictionary<MyItemType, double>();
+
+    // Fill the CargoContent Dictionary with information about the type and amount of contained items
+    public void UpdateItemList()
+    {
+        ItemList.Clear();
+
+        if (Owner == null || !Owner.IsFunctional || Inventory.ItemCount == 0)
+            return;
+
+        Inventory.GetItems(ItemList);
+    }
+
+
+    public void CountCargo()
+    {
+        CargoContent.Clear();
+
+        foreach (var item in ItemList)
+        {
+            if (CargoContent.ContainsKey(item.Type))
+                CargoContent[item.Type] += item.Amount;
+            else
+                CargoContent.Add(item.Type, item.Amount);
+        }
+    }
+
+
+    // Reads the CustomData from this block and save it in CustomData Dictionary
+    public void ReadCustomData(Program program)
+    {
+        CustomData.Clear();
+
+        if (Owner == null)
+            return;
+
+        if (Owner.CustomData.Length == 0)
+            WriteDefaultBlockMode();
+
+
+        string[] lines = Owner.CustomData.Split('\n');
+
+        switch (lines[0].Trim().ToLower())
+        {
+            case StorageTAG:
+                Mode = StorageBlockMode.Storage;
+                break;
+
+            case FillingTAG:
+                Mode = StorageBlockMode.Fill;
+                break;
+
+            case CleanAndFillTAG:
+                Mode = StorageBlockMode.CleanAndFill;
+                break;
+
+            case DissasembleTAG:
+                Mode = StorageBlockMode.Disassemble;
+                break;
+
+            case TeachModeTAG:
+                Mode = StorageBlockMode.TeachMode;
+                break;
+
+            case CleaningTAG:
+                Mode = StorageBlockMode.Clean;   // clean don't need customData
+                return;
+
+            case IgnoreTAG:
+                Mode = StorageBlockMode.Ignore;
+                return;
+
+            case AutoBuilderTAG:
+                Mode = StorageBlockMode.Autobuilder;
+                return;
+
+            default:
+                Mode = StorageBlockMode.NotDefined;
+                return;
+        }
+
+
+        switch(Mode)
+        {
+            case StorageBlockMode.Storage:
+            case StorageBlockMode.Disassemble:
+                {
+                    for (int i = 1; i < lines.Count(); i++)
+                    {
+                        lines[i] = lines[i].Trim();
+
+                        if (lines[i].Length == 0)
+                            continue;
+
+                        string[] definitionId = lines[i].Split('/');
+
+                        if (definitionId.Count() != 2)
+                            continue;
+
+                        MyItemType item = new MyItemType($"MyObjectBuilder_{definitionId[0]}", definitionId[1]);
+
+                        if (!CustomData.ContainsKey(item))
+                            CustomData.Add(item, 0);
+                    }
+                } break;
+
+
+            case StorageBlockMode.Fill:
+            case StorageBlockMode.CleanAndFill:
+                {
+                    for (int i = 1; i < lines.Count(); i++)
+                    {
+                        lines[i] = lines[i].Trim();
+
+                        if (lines[i].Length == 0)
+                            continue;
+
+                        string[] keyPair = lines[i].Split('=');
+
+                        if (keyPair.Count() != 2)
+                            continue;
+
+                        double amount = 0;
+                        double.TryParse(keyPair[1], out amount);
+
+                        if (amount < 0)
+                            amount = 0;
+
+                        string[] definitionId = keyPair[0].Split('/');
+
+                        if (definitionId.Count() != 2)
+                            continue;
+
+                        MyItemType item;
+
+                        if(definitionId[0].Contains("MyObjectBuilder_"))
+                            item = new MyItemType($"{definitionId[0]}", definitionId[1]);
+                        else
+                            item = new MyItemType($"MyObjectBuilder_{definitionId[0]}", definitionId[1]);
+
+                        if (CustomData.ContainsKey(item))
+                            CustomData[item] += amount;
+                        else
+                            CustomData.Add(item, amount);
+
+                        //program.Me.CustomData += $"Added '{item.ToString()}' to {this.Owner.CustomName}\n";
+                    }
+                } break;
+
+
+            case StorageBlockMode.TeachMode:
+                {
+                    CustomData.Clear();
+                    Owner.CustomData = TeachModeTAG;
+
+                    UpdateItemList();
+
+                    foreach (var item in ItemList)
+                    {
+                        if (!CustomData.ContainsKey(item.Type))
+                        {
+                            CustomData.Add(item.Type, 0);
+                            Owner.CustomData += $"\n{item.Type.TypeId.Replace("MyObjectBuilder_", "")}/{item.Type.SubtypeId}";
+                        }
+                    }
+                } break;
+
+
+            default:
+                break;
+        }
+    }
+
+
+    void WriteDefaultBlockMode()
+    {
+        // Set some default values
+
+        if (Owner is IMyCargoContainer || Owner is IMyGasTank)
+        {
+            Owner.CustomData = StorageTAG;
+            Mode = StorageBlockMode.Storage;
+        }
+
+        else if (Owner is IMyReactor)
+        {
+            Owner.CustomData = FillingTAG;
+            Mode = StorageBlockMode.Fill;
+        }
+
+        else if (Owner is IMyRefinery || Owner is IMyShipConnector || Owner is IMyAssembler)
+        {
+            Owner.CustomData = CleaningTAG;
+            Mode = StorageBlockMode.Clean;
+        }
+
+        else if (Owner is IMyCockpit)
+        {
+            Owner.CustomData = CleanAndFillTAG;
+            Mode = StorageBlockMode.CleanAndFill;
+        }
+
+        else
+        {
+            Owner.CustomData = IgnoreTAG;
+            Mode = StorageBlockMode.Ignore;
+        }
+    }
+
+
+
+
+    // Write Inventory-Items TypeDefinition into the CustomData if its missing
+    public void WriteCustomData()
+    {
+        Program a =  new Program();
+        // Read what allready is written inside CustomData
+        ReadCustomData(a);
+
+        switch (Mode)
+        {
+            case StorageBlockMode.Disassemble:
+            case StorageBlockMode.Storage:
+                {
+                    UpdateItemList();
+                    CountCargo();
+
+                    foreach (var itemType in CargoContent.Keys)
+                    {
+                        if (!CustomData.ContainsKey(itemType))
+                            Owner.CustomData += $"\n{itemType.TypeId.Replace("MyObjectBuilder_", "")}/{itemType.SubtypeId}";
+                    }
+
+                    return;
+                }
+
+            case StorageBlockMode.Fill:
+            case StorageBlockMode.CleanAndFill:
+                {
+                    UpdateItemList();   // count items to fill CargoContent
+                    CountCargo();
+
+                    foreach (var itemType in CargoContent)
+                    {
+                        if (!CustomData.ContainsKey(itemType.Key))
+                            Owner.CustomData += $"\n{itemType.Key.TypeId.Replace("MyObjectBuilder_", "")}/{itemType.Key.SubtypeId}={itemType.Value}";
+                    }
+                } break;
+
+            case StorageBlockMode.Clean:
+                {
+                    Owner.CustomData = CleaningTAG;
+                } break;
+
+            case StorageBlockMode.Ignore:
+                {
+                    Owner.CustomData = IgnoreTAG;
+                } break;
+
+            case StorageBlockMode.Autobuilder:
+                {
+                    Owner.CustomData = AutoBuilderTAG;
+                } break;
+
+            default:
+                return;
+        }
+    }
+
+    public List<MyInventoryItem> ItemList = new List<MyInventoryItem>();
+}
+
+// Stores in which inventory this item should be available
+class CLookupTable
+{
+    public void Add(MyItemType _itemType, IMyInventory _inventory)
+    {
+        if (!LookupTable.ContainsKey(_itemType))
+            LookupTable.Add(_itemType, new List<IMyInventory>());
+
+        LookupTable[_itemType].Add(_inventory);
+    }
+
+    public void Add(Dictionary<MyItemType, double> _customData, IMyInventory _inventory)
+    {
+        foreach(var itemType in _customData.Keys)
+        {
+            if (!LookupTable.ContainsKey(itemType))
+                LookupTable.Add(itemType, new List<IMyInventory>());
+
+            LookupTable[itemType].Add(_inventory);
+        }
+    }
+
+    public void Clear()
+    {
+        LookupTable.Clear();
+    }
+
+    public List<IMyInventory> GetInventoryList(MyItemType _itemType)
+    {
+        if (LookupTable.ContainsKey(_itemType))
+            return LookupTable[_itemType];
+        else
+            return null;
+    }
+
+    Dictionary<MyItemType, List<IMyInventory>> LookupTable = new Dictionary<MyItemType, List<IMyInventory>>();
+}
+
+
+class Thread
+{
+	public long ThreadId;						// the Id
+	public IEnumerator<bool> Function;			// Function Pointer
+	public Action<long, bool> Callback;         // Callback when function completed, return treathId & if function was killed or not
+	public bool Paused;							// Pause this execution
+}
+
+public class ThreadManager
+{
+	/// <summary>
+			/// Add and start a thread
+			/// </summary>
+			/// <param name="_id">the Id this thread get stored, required for KillThread function</param>
+			/// <param name="_function">the function to run</param>
+			/// <param name="_callback">the function which get called when the thread ends</param>
+			/// <param name="_loop">should it run infinite?</param>
+	public static bool AddThread(long _id, IEnumerator<bool> _function, Action<long, bool> _callback = null)
+    {
+		if (Threads.ContainsKey(_id))
+			return false;
+
+		// Create a new Thread
+		Thread newThread = new Thread()
+		{
+			ThreadId = _id,
+			Function = _function,
+			Callback = _callback,
+			Paused = false
+		};
+
+		Threads.Add(_id, newThread);    // Add to the collection
+		JobList.Push(newThread);        // Add it to the jobList
+
+		return true;
+    }
+
+
+	public static bool ExistsThread(long _id)
+    {
+		if (Threads.ContainsKey(_id))
+			return true;
+
+		return false;
+	}
+
+
+	// Kills a thread
+	public static void KillThread(long _id)
+    {
+		if (!Threads.ContainsKey(_id))
+			return;
+
+		Thread thread = Threads[_id];
+
+		thread.Function.Dispose();
+		thread.Callback?.Invoke(_id, false);   // return false because it got killed
+
+		Threads.Remove(_id);
+	}
+
+
+
+	// Pause a thread
+	public static void PauseThread(long _id)
+    {
+		if (Threads.ContainsKey(_id))
+			Threads[_id].Paused = true;
+	}
+
+
+	// Continue a paused thread
+	public static void ContinueThread(long _id)
+    {
+		if (Threads.ContainsKey(_id))
+			Threads[_id].Paused = false;
+	}
+
+
+	// Update Threads
+	public static void Update()
+    {
+		// No jobs left, refill them
+		if (JobList.Count == 0)
+        {
+			foreach (var thread in Threads.Where(t => !t.Value.Paused))
+			{
+				JobList.Push(thread.Value);
+			}
+
+			// No valid jobs todo
+			if (JobList.Count == 0)
+				return;
+		}
+
+		// execute the next job
+		Thread currentThread = JobList.Pop();
+
+		// Run to next yield
+		if (!currentThread.Function.MoveNext())
+        {
+			currentThread.Function.Dispose();
+			currentThread.Callback?.Invoke(currentThread.ThreadId, true);    // return true for successfull completed function
+			Threads.Remove(currentThread.ThreadId);
+        }
+    }
+
+
+
+	public static int ThreadCount
+    {
+		get { return Threads.Count; }
+    }
+
+	public static int RunningThreads
+    {
+		get { return (Threads.Where(t => !t.Value.Paused)).Count(); }
+    }
+
+	public static int PausedThreads
+	{
+		get { return (Threads.Where(t => t.Value.Paused)).Count(); }
+	}
+
+
+	static Dictionary<long, Thread> Threads = new Dictionary<long, Thread>();   // EntityId, Thread
+	static Stack<Thread> JobList = new Stack<Thread>();
+}
