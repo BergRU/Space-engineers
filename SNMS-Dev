@@ -21,7 +21,7 @@ const string AutoBuilder_Ammo_LCD = "Autobuilder Ammo";
 
 // Security Options
 const string WhiteListedGrids_LCD = "LCD Whitelist";    // Throw out all connected grid which not listed on this LCD
-const string FactionTag = "AMC";                        // Throw out all connection if not have this Faction Tag
+const string FactionTag = "SSC";                        // Throw out all connection if not have this Faction Tag
 
 const bool CountItems = false;                  // Count Items to show them on LCD [show on LCD not implemented yet]
 
